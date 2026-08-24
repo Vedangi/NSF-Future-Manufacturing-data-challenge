@@ -1,244 +1,433 @@
-NSF FUTURE MANUFACTURING DATA CHALLENGE — SUBMISSION
-====================================================================
-Team:       The Regularizers
-Members:    Vedangi Bengali, Dhawal Chaudhari
-University: Texas A&M University
+# Probabilistic Prediction of Laser-Track Geometry
 
-FILES
-  TheRegularizers_Report.pdf         3-page report (Arial 10pt, 1in margins)
-  TheRegularizers_Presentation.pptx  slide deck
-  TheRegularizers_Notebook.ipynb     executable end-to-end notebook
-  TheRegularizers_Predictions.csv    machine-readable spatial predictions
-  README.txt                         this file
-  code/                              run_pipeline.py + document generators
-  outputs/                           all metrics and figures
+**NSF Future Manufacturing Data Challenge submission by The Regularizers**
 
-SOFTWARE AND VERSIONS
-  Python 3.9.6 (CPU only, no GPU required)
-  numpy 2.0.2 | scipy 1.13.1 | pandas 2.3.3 | scikit-learn 1.6.1
-  matplotlib 3.9.4 | pillow 11.3.0 | h5py 3.14.0
-  python-docx 1.2.0 | python-pptx 1.0.2  (document generation only)
+Vedangi Bengali and Dhawal Chaudhari  
+Texas A&M University
 
-INSTALLATION AND EXECUTION
-  python3 -m venv .venv && source .venv/bin/activate
-  pip install numpy scipy pandas scikit-learn matplotlib pillow h5py \
-              python-docx python-pptx
-  pip install zenodo_get && zenodo_get 10.5281/zenodo.21285367 -o data_zips
-  mkdir -p data/raw
-  for z in thermal height_maps sem; do unzip -q data_zips/$z.zip -d data/raw; done
-  cp code/*.py .
-  python run_pipeline.py --data-root data/raw --headline thermal
-  # or open TheRegularizers_Notebook.ipynb and run all cells
+This repository contains an end-to-end, reproducible pipeline for predicting spatially
+varying laser-track geometry in directed energy deposition (DED). The approach uses
+in-situ melt-pool thermal imagery together with masked scanning electron microscopy
+(SEM) measurements of the surrounding substrate.
 
-INPUT / OUTPUT FOLDERS
-  input :  data/raw/thermal, data/raw/height_maps, data/raw/sem
-  output:  outputs/  (metrics.json, figures, CSVs, prediction file)
+The model predicts local track geometry as a function of scan position rather than
+reducing each track to a single average width. Predictions are probabilistic and include
+nine quantiles for the left boundary, right boundary, and width at 0.2 mm intervals.
 
-EXECUTION TIME AND HARDWARE
-  ~8 minutes total on an Apple M-series laptop, single process, CPU only.
-  Peak memory ~3 GB. Download is 0.67 GB; extracted data ~1.2 GB.
+> **Key result:** Using a feature-selection rule fixed entirely from leave-one-track-out
+> (LOTO) validation, the selected thermal-plus-SEM model achieved a held-out Track 21
+> MAE of **0.1233 mm**, compared with **0.2907 mm** for a constant-prediction baseline.
+> The analysis also found no reliable bin-to-bin predictive skill after track-level
+> variation was removed. This null result—and the tests used to validate it—is a central
+> finding of the project.
 
-RANDOM SEEDS AND PRETRAINED MODELS
-  Every model uses random_state=0. No pretrained models or external
-  weights are used. The pipeline has no other stochastic step, and all
-  reported floats are rounded to 6 dp, so metrics.json reproduces
-  byte-identically across reruns and machines.
+## Contents
 
-EXTERNAL DATA, CODE AND MODELS
-  Data:  Zenodo 10.5281/zenodo.21285367 (challenge dataset) only.
-  Code:  src/nsf_fmrg_data.py, the organizers' loader from the challenge
-         repository, used unmodified. Everything else is our own, built
-         on numpy / scipy / pandas / scikit-learn / matplotlib / pillow.
-  No external pretrained models.
+- [Project overview](#project-overview)
+- [Methodology](#methodology)
+- [Evaluation protocol](#evaluation-protocol)
+- [Results](#results)
+- [Installation](#installation)
+- [Reproducing the analysis](#reproducing-the-analysis)
+- [Prediction-file format](#prediction-file-format)
+- [Repository outputs](#repository-outputs)
+- [Limitations and scope](#limitations-and-scope)
+- [Reproducibility](#reproducibility)
+- [Acknowledgments and disclosure](#acknowledgments-and-disclosure)
 
-GENERATIVE AI USE
-  Anthropic Claude was used to assist with code implementation,
-  diagnostic plotting, document generation and drafting of the report,
-  slides and this file. All modelling choices, validation design,
-  diagnostics and physical interpretation were specified and verified by
-  the authors. Every number in the report, slides and this README is
-  generated programmatically from outputs/metrics.json by the submitted
-  code; none is transcribed by hand.
+## Project overview
 
-PREDICTION FILE FORMAT (TheRegularizers_Predictions.csv)
-  track_id        8, 10, 14 or 21
-  x_mm            position along the scan direction, actual part
-                  coordinates, 0.2 mm bin centres over 20-100 mm
-  split           LOTO_out_of_fold = predicted by a model that never saw
-                  that track; FINAL_held_out = track 21 from the model
-                  trained on tracks 8/10/14
-  descriptor      left | right | width   (geometry component)
-  pred_q10_mm ... pred_q90_mm   nine predicted quantiles, millimetres
-  reference_mm    our profilometer-derived reference (blank where the
-                  height map yielded no usable cross-section)
-  reference_valid whether a reference value exists for that bin
-  Cross-track convention: left/right are y positions in height-map
-  coordinates, y=0 at the first profilometer row; width = right - left.
-  All units are millimetres.
+The goal of the challenge is to infer the final local geometry of a laser track from a
+sequence of thermal images recorded during laser scanning. Our pipeline:
 
-====================================================================
-The remainder of this file is generated from outputs/metrics.json and
-documents the results in detail.
-====================================================================
+1. extracts spatially resolved track geometry from profilometer height maps;
+2. derives melt-pool and thermal-field descriptors from the thermal recordings;
+3. constructs substrate descriptors from SEM images after masking the processed track;
+4. trains quantile-regression models for local width and boundary position;
+5. evaluates generalization with grouped, leave-one-track-out validation; and
+6. calibrates predictive intervals using conformalized quantile regression (CQR).
 
-Probabilistic prediction of laser-track geometry in directed energy
-deposition from in-situ melt-pool thermal imaging and masked SEM
-substrate morphology, validated leave-one-track-out with track 21 as the
-held-out final test.  Dataset DOI 10.5281/zenodo.21285367.
+The challenge dataset is available from
+[Zenodo (DOI: 10.5281/zenodo.21285367)](https://doi.org/10.5281/zenodo.21285367).
 
-## How track 21 was used — read this first
+## Methodology
 
-Track 21 is the held-out final test, so it may be touched **once**. Choosing a feature set or an interval type by looking at its track-21 score turns it into a validation set and biases the headline number. We therefore fixed a selection rule that uses **only** the leave-one-track-out folds:
+### Geometry representation
 
-> feature set = lowest mean CRPS over the leave-one-track-out folds; intervals = conformalised (CQR), calibrated on held-out tracks. Both decided without reference to track 21.
+For scan position \(x\), the local geometry is represented by:
 
-That rule selects **`thermal+sem`**. Its track-21 score is the primary, unbiased result:
+- left boundary \(y_{\mathrm{left}}(x)\);
+- right boundary \(y_{\mathrm{right}}(x)\); and
+- width \(w(x) = y_{\mathrm{right}}(x)-y_{\mathrm{left}}(x)\).
 
-| Primary (unbiased) — thermal+sem + CQR | Value |
-|---|---|
+The output grid uses 0.2 mm bin centers over the 20–100 mm scan interval. All geometry
+values are reported in millimeters.
+
+### Input modalities
+
+- **Thermal:** descriptors of the melt pool and surrounding thermal field.
+- **SEM:** substrate-morphology features computed only outside the processed track.
+- **Thermal + SEM:** the combined descriptor set.
+
+For SEM feature extraction, the final laser track is masked with an additional 0.30 mm
+safety margin. Per-tile normalization reduces brightness-based track fingerprinting, the
+burned-in data bar is cropped, and the complete `Scale_` image set is used consistently
+across all tracks.
+
+### Probabilistic model
+
+Nine quantile models are fit at quantiles 0.1 through 0.9. Quantile crossing is corrected
+by sorting the predicted quantile ladder. CQR uses errors from a held-out track so that
+the correction reflects cross-condition generalization error.
+
+## Evaluation protocol
+
+### Held-out test policy
+
+Track 21 is treated as the final held-out test track. It must not be used to select a
+feature set, model class, or interval-calibration method.
+
+The primary configuration is selected using only the LOTO folds over the remaining
+tracks:
+
+> Select the feature set with the lowest mean LOTO continuous ranked probability score
+> (CRPS), and use CQR intervals calibrated on held-out tracks.
+
+This rule selects **`thermal+sem`**. Its Track 21 result is therefore the primary
+selection-independent result.
+
+The three plausible LOTO selection rules are not stable:
+
+| LOTO selection rule | Selected features | Track 21 MAE |
+|---|---:|---:|
+| Lowest mean CRPS | `thermal+sem` | 0.1233 mm |
+| Lowest mean MAE | `sem` | 0.1875 mm |
+| Best coverage | `sem` | 0.1875 mm |
+
+With only three model-selection folds, the choice of feature set is uncertain. We report
+that instability rather than treating the selected configuration as definitive.
+
+### Selection-informed comparison
+
+For transparency, the thermal-only model with raw intervals achieved a Track 21 MAE of
+**0.1032 mm**, CRPS of 0.0915 mm, coverage of 0.736, and calibration error of 0.054.
+However, no LOTO rule selected this configuration; it was identified after examining
+Track 21. These values are therefore descriptive and **not an unbiased final-test
+estimate**.
+
+The packaged figures, `predictions_track21.csv`, and `feature_importance.*` use the
+thermal-only configuration selected with `--headline thermal`. Both the primary and
+selection-informed results are retained in `outputs/metrics.json`.
+
+## Results
+
+### Primary held-out result
+
+| Thermal + SEM with CQR | Track 21 result |
+|---|---:|
 | MAE | **0.1233 mm** |
 | CRPS | 0.0871 mm |
-| 80% interval coverage | **0.907** (nominal 0.80) |
+| 80% interval coverage | **0.907** |
 | Calibration error | 0.107 |
-| Constant-prediction baseline | 0.2907 mm (2.4× worse) |
+| Constant-prediction baseline MAE | 0.2907 mm |
 
-**The selection is not stable.** The three sensible LOTO rules pick different feature sets:
+The primary model reduces MAE by approximately 58% relative to the constant-prediction
+baseline.
 
-| LOTO rule | picks | its track-21 MAE |
+### Modality ablation
+
+Each evaluation is repeated with thermal features, SEM features, and both modalities.
+
+| Feature set | Features | Within-track MAE | Within-track \|r\| | LOTO MAE | LOTO CRPS | Track 21 MAE | Track 21 raw coverage |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| `thermal` | 33 | 0.1087 mm | 0.071 | 0.2383 mm | 0.1881 mm | 0.1032 mm | 0.736 |
+| `sem` | 16 | 0.1139 mm | 0.075 | 0.2241 mm | 0.1625 mm | 0.1875 mm | 0.450 |
+| `thermal+sem` | 49 | 0.1103 mm | 0.041 | 0.2375 mm | 0.1603 mm | 0.1233 mm | 0.354 |
+
+Predicting each track's own mean width produces a within-track MAE of 0.1044 mm. No
+feature set improves on this baseline for local bin-to-bin variation.
+
+### Local-skill investigation
+
+We tested whether the absence of local predictive skill could be explained by common
+pipeline failures.
+
+| Possible explanation | Diagnostic | Finding |
 |---|---|---|
-| lowest LOTO mean CRPS | `thermal+sem` | 0.1233 mm |
-| lowest LOTO mean MAE | `sem` | 0.1875 mm |
-| best LOTO coverage | `sem` | 0.1875 mm |
+| Noisy ground truth | Split-half reliability | Unlikely: reliability 0.918–0.956; estimated \|r\| ceiling ≈ 0.97 |
+| Thermal misregistration | 51-lag sweep, surrogate null, and transfer test | No reproducible improvement |
+| Inappropriate target | Seven geometry definitions | No target produced positive local skill |
+| Inappropriate spatial scale | 0.2, 0.4, and 1.0 mm grids | No scale recovered local skill |
+| Inappropriate model class | Tree, linear, and hybrid models | No tested model recovered local skill |
+| Missing substrate information | Masked SEM ablation | No robust local improvement |
 
-With only three cross-validation folds, model selection is itself unreliable — that is a finding, not an inconvenience.
+#### Ground-truth reliability
 
-**Reported for transparency, but NOT unbiased:** the `thermal`-only configuration with raw intervals scores MAE **0.1032 mm**, CRPS 0.0915 mm, coverage 0.736, calibration error 0.054 — better than the primary result on every count. But `thermal` is chosen by **no** LOTO criterion; it was identified as best *after* seeing track 21. The figures, `predictions_track21.csv` and `feature_importance.*` in this package use that configuration (`--headline thermal`), so treat those track-21 numbers as validation-informed. Both sets are in `metrics.json`.
+Each bin contains approximately 50 height-map columns. Measuring width independently
+from two half-bin samples gives split-half correlations of 0.848–0.916 and
+Spearman–Brown reliabilities of 0.918–0.956. Estimated full-bin measurement noise is
+27–40 µm, compared with observed width variation of 94–168 µm. The target therefore has
+substantial measurable variation that the current feature set does not explain.
 
-## Modality ablation
+#### Registration
 
-Every evaluation is run three times. SEM features come only from substrate, with the processed track masked out plus a 0.30 mm margin.
+A thermal-lag sweep increases the best observed correlation to approximately 0.2, but
+the same search over 800 circular-shift surrogates—preserving each series'
+autocorrelation—produces a mean maximum correlation of 0.146 and a 95th percentile of
+0.204. Optimal lags vary from −19 to −2 bins across tracks. A lag selected from the
+other tracks improves only two of four held-out tracks, and all resulting skill scores
+remain negative.
 
-| Feature set | n | Within-track MAE | within \|r\| | LOTO MAE | LOTO CRPS | FINAL MAE | FINAL cov. |
-|---|---|---|---|---|---|---|---|
-| `thermal` | 33 | 0.1087 mm | 0.071 | 0.2383 mm | 0.1881 | 0.1032 mm | 0.736 |
-| `sem` | 16 | 0.1139 mm | 0.075 | 0.2241 mm | 0.1625 | 0.1875 mm | 0.450 |
-| `thermal+sem` ← | 49 | 0.1103 mm | 0.041 | 0.2375 mm | 0.1603 | 0.1233 mm | 0.354 |
+#### Target and scale search
 
-Predicting each track's own mean width gives a within-track MAE of 0.1044 mm — **no feature set beats it.**
+The search covers 21 target-scale combinations: width, left and right boundaries,
+centerline, left and right edge roughness, and waviness at 0.2, 0.4, and 1.0 mm. Every
+combination performs below a constant predictor; the best result is `width_mm@0.2mm`
+with a skill score of −0.0421.
 
-## The null result, and the alternatives we eliminated
+#### SEM alignment
 
-No configuration shows local (bin-to-bin) predictive skill. A negative finding is only worth anything if the boring explanations were ruled out, so each was tested directly.
+Masked SEM features do not recover local skill. SEM-derived and profilometer-derived
+widths correlate by only +0.03 to +0.19 at 0.2 mm, and no global shift resolves the
+disagreement. Because the released tiles can only be placed on the physical axis to
+within several millimeters—roughly ten times the target-grid spacing—the local substrate
+hypothesis remains **untested rather than refuted**.
 
-| Could the null be caused by…? | Tested how | Answer |
-|---|---|---|
-| A noisy ground truth | split-half reliability | **No** — 0.918–0.956, ceiling \|r\| ≈ 0.97 |
-| Misaligned thermal data | 51-lag sweep + surrogate null + transfer test | **No** |
-| The wrong target | 7 definitions | **No** |
-| The wrong spatial scale | 0.2 / 0.4 / 1.0 mm | **No** |
-| The wrong model class | trees / linear / hybrid | **No** |
-| A missing sensor | SEM ablation with masking | **No** |
+### Model comparison
 
-**Reliability.** Splitting the ~50 height-map columns per bin into two halves and measuring width from each gives split-half correlation 0.848–0.916 (Spearman-Brown 0.918–0.956). Full-bin measurement noise is 27–40 µm against a real width variation of 94–168 µm, i.e. 4–8% of the variance. **The target is well measured — there is large headroom that the model does not reach, not a ceiling it has hit.**
+| Model class | LOTO MAE | Track 21 MAE |
+|---|---:|---:|
+| Gradient-boosted trees | 0.2317 mm | 0.1082 mm |
+| Linear quantile regression | 0.2754 mm | 0.2964 mm |
+| Linear anchor + tree residual | 0.2807 mm | 0.3282 mm |
 
-**Registration.** Sweeping the thermal lag raises the best correlation to ~0.2, but the same search over 800 circular-shift surrogates (which preserve each series' autocorrelation) already returns 0.146 on average (95th pct 0.204). Optimal lags disagree across tracks (-19 to -2 bins), and a lag chosen on the other tracks improves 2/4 held-out tracks; all skills remain negative.
+Tree models cannot extrapolate beyond the response range represented in training, which
+is especially limiting for the Track 8 fold. The tested linear alternatives extrapolate
+but do so in the wrong direction: a trend fitted to two process conditions does not
+reliably predict a third. Raw-frame, temporal, hierarchical, and physics-informed models
+remain promising directions for future work.
 
-**Target and scale.** 21 combinations — width, left and right boundary, centre-line, edge roughness each side, waviness — at 0.2, 0.4 and 1.0 mm, on every track. All score below a constant predictor; the best is `width_mm@0.2mm` at -0.0421.
+### Uncertainty calibration
 
-**SEM.** Adding masked substrate features does not recover local skill. The SEM and the profilometer both measure how wide the track is, so they should agree; at 0.2 mm they correlate only +0.03 to +0.19, and no global shift fixes it. The released tiles cannot be placed on the physical axis to better than a few millimetres — 10× coarser than the target grid, so the substrate hypothesis is **untested rather than refuted**.
-
-## Model bake-off
-
-Trees cannot predict outside their training range, which is what breaks the track-8 fold, so a model that extrapolates ought to win. It does not.
-
-| Model class | LOTO MAE | FINAL MAE |
-|---|---|---|
-| gradient-boosted trees | 0.2317 mm | 0.1082 mm |
-| linear quantile regression | 0.2754 mm | 0.2964 mm |
-| linear anchor + tree residual | 0.2807 mm | 0.3282 mm |
-
-Linear models do extrapolate — in the wrong direction. A trend through two process conditions does not predict a third. This is not a proof that no model can do better: raw-frame, temporal, hierarchical and physics-informed formulations remain untested.
-
-## Uncertainty
-
-Nine quantile models (q = 0.1 … 0.9), crossing removed by sorting the ladder. Conformalised quantile regression (CQR) is calibrated on a **held-out track**, so the correction reflects cross-condition error.
-
-| | 80% coverage | Interval width | Calibration error |
-|---|---|---|---|
+| Evaluation | 80% coverage | Mean interval width | Calibration error |
+|---|---:|---:|---:|
 | LOTO, raw | 0.403 | 0.303 mm | 0.285 |
 | LOTO, CQR | 0.693 | 0.759 mm | — |
-| FINAL `thermal+sem`, CQR (primary) | 0.907 | 0.658 mm | 0.107 |
-| FINAL `thermal`, raw (selection-informed) | 0.736 | 0.395 mm | 0.054 |
+| Track 21, `thermal+sem` + CQR (primary) | 0.907 | 0.658 mm | 0.107 |
+| Track 21, `thermal` raw (selection-informed) | 0.736 | 0.395 mm | 0.054 |
 
-Coverage curve for the `thermal` configuration, nominal 0.2/0.4/0.6/0.8 → empirical 0.24/0.48/0.57/0.74.
+For the thermal-only configuration, nominal coverages of 0.2, 0.4, 0.6, and 0.8 yield
+empirical coverages of 0.24, 0.48, 0.57, and 0.74, respectively.
 
-## Ground truth extracted from the height maps
+### Extracted ground truth
 
-| Track | Raster NaN | Usable bins | Mean width | Width SD | Crown rise | Reliability |
-|---|---|---|---|---|---|---|
+| Track | Raster NaN fraction | Usable bins | Mean width | Width SD | Crown rise | Reliability |
+|---:|---:|---:|---:|---:|---:|---:|
 | 8 | 0.369 | 381/400 | 0.849 mm | 0.162 mm | 8.5 µm | 0.949 |
 | 10 | 0.516 | 348/400 | 0.516 mm | 0.135 mm | 4.3 µm | 0.920 |
 | 14 | 0.511 | 374/400 | 0.471 mm | 0.136 mm | 5.0 µm | 0.956 |
 | 21 | 0.555 | 333/400 | 0.325 mm | 0.098 mm | 1.5 µm | 0.918 |
 
-## Reproducing from scratch
+## Installation
 
-Python 3.9+, ~1.9 GB free disk (0.67 GB download). Runtime after download: **~8 min**.
+### Requirements
+
+- Python 3.9 or newer
+- Approximately 1.9 GB of available disk space
+- CPU only; no GPU or pretrained model is required
+
+The submitted environment used Python 3.9.6 with:
+
+| Package | Version |
+|---|---:|
+| NumPy | 2.0.2 |
+| SciPy | 1.13.1 |
+| pandas | 2.3.3 |
+| scikit-learn | 1.6.1 |
+| Matplotlib | 3.9.4 |
+| Pillow | 11.3.0 |
+| h5py | 3.14.0 |
+| python-docx | 1.2.0 |
+| python-pptx | 1.0.2 |
+
+`python-docx` and `python-pptx` are needed only to regenerate the report and slide deck.
+
+### Environment setup
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+
+python -m pip install --upgrade pip
+python -m pip install \
+  numpy scipy pandas scikit-learn matplotlib pillow h5py \
+  python-docx python-pptx zenodo_get
+```
+
+## Reproducing the analysis
+
+### 1. Obtain the repository and data
 
 ```bash
 git clone https://github.com/abhishekhanchate/nsf-fmrg-data-challenge.git
 cd nsf-fmrg-data-challenge
-python3 -m venv .venv && source .venv/bin/activate
-pip install numpy scipy pandas scikit-learn matplotlib pillow h5py \
-            python-docx python-pptx
 
-pip install zenodo_get
 zenodo_get 10.5281/zenodo.21285367 -o data_zips
 mkdir -p data/raw
-for z in thermal height_maps sem; do unzip -q data_zips/$z.zip -d data/raw; done
 
-cp code/*.py .
-python run_pipeline.py --data-root data/raw --tracks 8 10   # smoke test
-python run_pipeline.py --data-root data/raw --headline thermal   # full run
-python make_report.py  --out outputs --docx TheRegularizers_Report.docx
-python make_slides.py  --out outputs --pptx TheRegularizers_Presentation.pptx
-python make_readme.py  --out outputs --md   README.txt
+for archive in thermal height_maps sem; do
+  unzip -q "data_zips/${archive}.zip" -d data/raw
+done
 ```
 
-`--headline` selects which configuration the figures and `predictions_track21.csv` use; it does not change any metric. The packaged outputs use `thermal`. The primary unbiased result (`thermal+sem`) is in `metrics.json` under `selection_protocol` regardless of the flag.
-
-### Expected data layout
+### 2. Confirm the expected data layout
 
 ```text
-data/raw/thermal/Thermal_{8,10,14,21}.mat
-data/raw/height_maps/Heightmap_{8,10,14,21}.ASC
-data/raw/sem/SEM_{8,10,14,21}/            (Scale_*.tif used; PlainImages/ present)
+data/raw/
+├── thermal/
+│   └── Thermal_{8,10,14,21}.mat
+├── height_maps/
+│   └── Heightmap_{8,10,14,21}.ASC
+└── sem/
+    └── SEM_{8,10,14,21}/
+        ├── Scale_*.tif
+        └── PlainImages/
 ```
 
-`run_pipeline.py` must sit in the repo root next to `src/nsf_fmrg_data.py`.
+`run_pipeline.py` must be in the repository root alongside
+`src/nsf_fmrg_data.py`. The organizer-provided loader is used without modification.
 
-### Determinism
+### 3. Run the pipeline
 
-All models use `random_state=0` and the pipeline performs no other stochastic operation. Reported floats are rounded to 6 decimal places so `metrics.json` is byte-identical across reruns; without rounding, different BLAS builds differ in the last 1–2 ulp (~1e-16) on correlation coefficients.
+```bash
+# Optional smoke test
+python run_pipeline.py --data-root data/raw --tracks 8 10
 
-## Outputs
+# Full analysis
+python run_pipeline.py --data-root data/raw --headline thermal
+```
+
+Alternatively, open `TheRegularizers_Notebook.ipynb` and run all cells.
+
+The `--headline` option controls which configuration is used in the figures and
+`predictions_track21.csv`; it does not change the metrics computed for any
+configuration. The packaged artifacts use `thermal`. The unbiased `thermal+sem` result
+is always stored under `selection_protocol` in `outputs/metrics.json`.
+
+### 4. Regenerate the report and presentation
+
+```bash
+python make_report.py \
+  --out outputs \
+  --docx TheRegularizers_Report.docx
+
+python make_slides.py \
+  --out outputs \
+  --pptx TheRegularizers_Presentation.pptx
+```
+
+Typical runtime after downloading the data is approximately eight minutes on an Apple
+M-series laptop using one CPU process. Peak memory usage is approximately 3 GB. The
+download is about 0.67 GB and expands to approximately 1.2 GB.
+
+## Prediction-file format
+
+`TheRegularizers_Predictions.csv` contains machine-readable spatial predictions.
+
+| Column | Description |
+|---|---|
+| `track_id` | Track identifier: 8, 10, 14, or 21 |
+| `x_mm` | Scan-direction position in physical coordinates; 0.2 mm bin centers over 20–100 mm |
+| `split` | `LOTO_out_of_fold` or `FINAL_held_out` |
+| `descriptor` | Geometry component: `left`, `right`, or `width` |
+| `pred_q10_mm` … `pred_q90_mm` | Nine predicted quantiles in millimeters |
+| `reference_mm` | Profilometer-derived reference; blank when no usable cross-section exists |
+| `reference_valid` | Indicates whether a reference value is available for the bin |
+
+For `LOTO_out_of_fold`, each track is predicted by a model that did not observe that
+track during training. `FINAL_held_out` denotes Track 21 predictions from the model fit
+on Tracks 8, 10, and 14.
+
+Left and right are \(y\)-positions in the height-map coordinate system, with \(y=0\) at
+the first profilometer row. Width equals right minus left. All values are in millimeters.
+
+## Repository outputs
+
+### Submission artifacts
+
+| Path | Description |
+|---|---|
+| `TheRegularizers_Report.pdf` | Three-page technical report |
+| `TheRegularizers_Presentation.pptx` | Presentation deck |
+| `TheRegularizers_Notebook.ipynb` | Executable end-to-end notebook |
+| `TheRegularizers_Predictions.csv` | Machine-readable spatial predictions |
+| `code/` | Pipeline and document-generation scripts |
+| `outputs/` | Generated metrics, tables, predictions, and figures |
+
+### Generated analysis files
 
 | File | Contents |
 |---|---|
-| `metrics.json` | every metric, the ablation, selection protocol, reliability, lag check, skill search and bake-off |
-| `features_and_targets.csv` | all features + extracted geometry per 0.2 mm bin |
-| `predictions_track21.csv` | per-bin quantile ladder for the final test |
-| `feature_importance.{csv,png}` | importances of the median model |
-| `ground_truth_extraction.png` | how the bead is segmented |
-| `sem_masking.png` | how the track is masked out of each SEM tile |
-| `measured_width_all_tracks.png` | measured w(x) for all four tracks |
-| `within_track_cv.png` | out-of-fold within-track spatial CV |
-| `local_skill_search.png` | 21 target × scale combinations |
-| `ablation.png` | three-way modality comparison |
-| `prediction_track_{8,10,14,21}.png` | LOTO folds and the final test |
+| `metrics.json` | Complete metrics, ablations, selection protocol, reliability, lag analysis, target search, and model comparison |
+| `features_and_targets.csv` | Extracted features and geometry for every 0.2 mm bin |
+| `predictions_track21.csv` | Per-bin Track 21 quantile predictions |
+| `feature_importance.csv` / `.png` | Median-model feature importances |
+| `ground_truth_extraction.png` | Height-map segmentation diagnostic |
+| `sem_masking.png` | SEM masking diagnostic |
+| `measured_width_all_tracks.png` | Measured width functions for all tracks |
+| `within_track_cv.png` | Out-of-fold within-track spatial validation |
+| `local_skill_search.png` | Target-by-scale local-skill comparison |
+| `ablation.png` | Modality ablation |
+| `prediction_track_{8,10,14,21}.png` | LOTO-fold and held-out prediction plots |
 
-## Scope notes
+## Limitations and scope
 
-- **SEM is used with the track masked out.** The tiles image the region containing the finished track, so it is located and excluded with a 0.30 mm margin before any feature is computed. Tiles are normalised per-tile so brightness cannot fingerprint a track, and the `Scale_` set is used for all four tracks (the only complete set — track 14's `PlainImages` holds twelve `Scale_` copies and one `Plain_` file) with the burned-in data bar cropped.
-- **No track-ID → laser-power mapping is claimed.** The dataset paper states four powers were investigated but does not publish which track is which.
-- **`run_pipeline.py` is the single source of truth.** The one substantive change to the supplied pipeline was the ground-truth width extraction: these are bead-on-plate remelt tracks, so the crown rises only a few microns and the original bump-threshold rule found a bead in 6 of 400 bins on track 8. It was replaced with segmentation on surface finish, corroborated by the height dome and by the thermal melt-pool width.
+- **Local predictive skill was not established.** The model predicts cross-condition
+  width differences but does not reliably explain fine-scale bin-to-bin variation.
+- **Model selection is unstable.** Three LOTO selection criteria choose different
+  feature sets because only three selection folds are available.
+- **SEM placement is coarse.** Tile localization is several millimeters uncertain, so
+  the substrate hypothesis cannot be tested conclusively at a 0.2 mm spatial scale.
+- **Track-to-power labels are not assumed.** The dataset paper reports four laser powers
+  but does not publish a track-ID-to-power mapping.
+- **The model search is not exhaustive.** Raw-frame, temporal, hierarchical, and
+  physics-informed approaches remain untested.
+
+### Height-map segmentation note
+
+These samples are bead-on-plate remelt tracks whose crowns rise only a few micrometers.
+The original bump-threshold rule detected a bead in only 6 of 400 bins for Track 8. We
+therefore segment the track using surface finish, corroborated by the height dome and
+thermal melt-pool width. This is the only substantive modification to the supplied data
+pipeline; `run_pipeline.py` remains the single source of truth for all reported results.
+
+## Reproducibility
+
+All models use `random_state=0`, no pretrained models or external weights are used, and
+the pipeline has no additional stochastic step. Reported floating-point values are
+rounded to six decimal places, allowing `metrics.json` to reproduce byte-for-byte across
+reruns. Without rounding, different BLAS implementations can differ in the final one or
+two units in the last place for correlation coefficients.
+
+## Acknowledgments and disclosure
+
+### External resources
+
+- **Dataset:** NSF Future Manufacturing Data Challenge dataset,
+  [DOI 10.5281/zenodo.21285367](https://doi.org/10.5281/zenodo.21285367).
+- **Organizer code:** `src/nsf_fmrg_data.py`, used without modification.
+- **Libraries:** NumPy, SciPy, pandas, scikit-learn, Matplotlib, Pillow, and h5py.
+- **Pretrained models:** None.
+
+### Generative-AI assistance
+
+Anthropic Claude assisted with code implementation, diagnostic plotting, document
+generation, and drafting. The authors specified and verified all modeling decisions,
+validation procedures, diagnostics, and physical interpretations. Every numerical value
+in the report, presentation, and repository documentation is generated programmatically
+from `outputs/metrics.json`; no reported result is manually transcribed.
+
+---
+
+For detailed experimental context, see `TheRegularizers_Report.pdf`. For a complete,
+executable workflow, see `TheRegularizers_Notebook.ipynb` or run `run_pipeline.py`.
